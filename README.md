@@ -225,7 +225,11 @@ docker compose up -d
 | Service | Default URL | Host port variable |
 |---------|-------------|--------------------|
 | App | http://localhost:3000 | `FRONTEND_PORT` |
-| API docs | http://localhost:8000/docs | `BACKEND_PORT` |
+| API docs | http://localhost:8000/docs (from the Docker host only) | `BACKEND_PORT` |
+
+The backend port is bound to `127.0.0.1` by default. Browsers and API clients
+should use the app URL, where `/api` is proxied with security headers and the
+real client address for rate limiting.
 
 ### 4. First Sync
 
@@ -348,11 +352,15 @@ If you are already locked out of multi-user mode, set `USER_MODE=single` in the 
 | `USER_MODE` | Pin the mode from the environment, overriding the stored setting and disabling the in-app toggle. `single` forces single-user (no login screen) and is the recovery hatch after a multi-user lockout; `multi` forces multi-user. Because `single` disables authentication, use it only on a local/LAN install and unset it once recovered. Unset means the in-app setting controls the mode. | *(unset)* |
 | `PUBLIC_MODE` | Enable SEO meta tags, Open Graph, and allow search engine indexing. Default blocks all crawlers. Recreate the frontend container after changing it. | `false` |
 | `POKECOLLECTOR_VERSION` | Optional frontend and backend image-tag override for controlled deployments and rollbacks. Leave unset to use the exact release bundled with `docker-compose.yml`; `latest` is available only when deliberately requested. | Bundled release version |
-| `CORS_ORIGINS` | Comma-separated list of allowed origins for CORS. If empty, allows all origins. Set to your domain for production (e.g. `https://pokecollector.romerg.de`). | *(all)* |
+| `CORS_ORIGINS` | Comma-separated list of extra origins allowed to call the API from a browser. Leave empty for the bundled setup: the app and API share one origin, so no CORS headers are sent. A literal `*` allows any origin but never with credentials. | *(same-origin only)* |
+| `RATE_LIMIT_DEFAULT` | Per-client budget for API requests (card and Pokédex images are exempt), in [limits](https://limits.readthedocs.io/) notation | `600/minute` |
+| `RATE_LIMIT_LOGIN` | Per-client budget for login attempts. Separately, an account is locked for 15 minutes after 10 failed attempts from any address. | `5/minute` |
+| `FORWARDED_ALLOW_IPS` | Peers whose `X-Forwarded-For` header uvicorn trusts for the client address. The default covers the bundled nginx on the Compose network. Do not widen it while the backend port is reachable by clients. | Loopback and private ranges |
 | `PRE_UPGRADE_BACKUP_ENABLED` | Create an automatic SQL backup before startup migrations when an existing install starts on a new app version | `true` |
 | `PRE_UPGRADE_BACKUP_REQUIRED` | Stop startup if the automatic pre-upgrade backup fails. Set to `false` only if you have another verified backup process. | `true` |
 | `PRE_UPGRADE_BACKUP_KEEP` | Number of automatic pre-upgrade backups to retain in `/app/backups`; minimum `1` | `10` |
 | `BACKEND_PORT` | Host port the backend is published on. Change it if another stack on the same host already uses `8000`. The container port is unaffected. | `8000` |
+| `BACKEND_BIND` | Host address the backend port is bound to. Keep the default so clients reach the API only through the frontend proxy. | `127.0.0.1` |
 | `FRONTEND_PORT` | Host port the frontend is published on. Change it if another stack on the same host already uses `3000`. The container port is unaffected. | `3000` |
 
 This table covers variables passed through by the bundled Compose file. Custom

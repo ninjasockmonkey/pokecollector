@@ -10,6 +10,10 @@ Severity: **Critical** = remote compromise is realistic on a default install;
 **Medium** = real issue but needs a specific setup or has limited blast
 radius; **Low** = hardening / hygiene.
 
+> **Status:** most findings are fixed on branch
+> `claude/inspiring-hamilton-nhdl7j`. See [§7 Remediation status](#7-remediation-status)
+> for what changed and what remains open.
+
 ---
 
 ## Summary
@@ -389,3 +393,33 @@ built images.
 5. Restrict shared-card image overrides, scope cross-trainer collection
    reads, and add token versioning plus a password policy (1.6–1.8).
 6. Clean up backups and settings handling, then the efficiency items (§2).
+
+---
+
+## 7. Remediation status
+
+Fixed on `claude/inspiring-hamilton-nhdl7j`. Every fix has tests; the backend
+suite now passes in full (1006 passed, 0 failed, previously 64 failing), plus
+18 PostgreSQL integration tests and 320 frontend tests.
+
+| Finding | Status | What changed |
+|---|---|---|
+| 1.1 Drive-by RCE via restore | **Fixed** | Uploaded SQL is run inside psql `\restrict` mode with a random per-restore key, so `\!` and every other meta-command is refused (verified against a real psql). `COPY ... PROGRAM` is rejected before psql starts. A CSRF guard (below) blocks cross-site uploads. *Residual:* restore still runs as the DB owner (superuser in the stock image), so SQL-level tricks such as `DO`/`EXECUTE` remain possible for an **admin**; tracked as a follow-up. |
+| 1.2 CORS reflection | **Fixed** | No CORS middleware unless `CORS_ORIGINS` is set. `*` never sends credentials. Added `X-Requested-With` to the allowed headers. |
+| CSRF (new control) | **Added** | Unsafe `/api/*` requests without a Bearer token must carry `X-Requested-With`; the SPA sends it everywhere. Bearer-token clients are unaffected; login is exempt. |
+| 1.3 Rate limiting | **Fixed** | Replaced slowapi with `services/rate_limit.py` (path-based, `limits` library). Upgrading FastAPI showed that slowapi can no longer find routes inside included routers and **silently stops limiting them**. Images and health are exempt; the default is `600/minute` per client, login is `5/minute` per client, and an account locks for 15 minutes after 10 failures from any address. uvicorn runs with `--proxy-headers` and `FORWARDED_ALLOW_IPS`; nginx **overwrites** `X-Forwarded-For` so clients cannot inject it. |
+| 1.4 Dependencies | **Fixed** | FastAPI 0.142.2 / Starlette 1.7.0, uvicorn 0.54.0, PyJWT 2.15.1 (replaces python-jose and ecdsa), pinned bcrypt 5.0.0 with a 72-byte guard, python-multipart 0.0.32, axios ^1.20.0. `pip-audit` and `npm audit --omit=dev` both report 0 vulnerabilities. |
+| 1.5 Published backend port | **Fixed** | Bound to `${BACKEND_BIND:-127.0.0.1}`. `scripts/check-compose-ports.mjs` now enforces the localhost bind. |
+| 1.6 Image proxy | **Partly fixed** | Every proxied image is restricted to raster types (the format comes from magic bytes when the CDN sends a generic type), served with `CSP: sandbox` and `nosniff`, and catalogue fetches are capped at 10 MB. *Open:* per-user rather than global overrides for shared catalogue cards, and DNS-rebinding-safe connection pinning. |
+| 1.7 Cross-trainer purchase prices | **Fixed** | `purchase_price` and `product_sources` are stripped when viewing another trainer's collection. *Open:* opt-out from leaderboard and cross-trainer viewing. |
+| 1.8 Sessions and passwords | **Fixed** | `users.token_version` plus a `tv` claim: password change, admin reset, role change, and deactivation revoke existing tokens. Password changes return a replacement token, which the frontend stores. `must_change_password` is enforced server-side. Minimum 8 characters, maximum 72 bytes. `role` is validated as `admin`/`trainer`. A dummy bcrypt check runs for unknown users. *Open:* force-change for the auto-generated bootstrap password (needs UX for single-user mode). |
+| 1.9 Settings | **Partly fixed** | Generic endpoints accept only known keys, with values capped at 64 KiB. *Open:* encrypt secrets at rest and stop returning the Telegram token to the browser. |
+| 1.10 Backup files on disk | **Fixed** | Downloads are deleted after they are sent (also on failure or timeout). |
+| 1.11 Error leakage | **Fixed** | pg_dump/psql stderr and `str(e)` in 500 responses (`api/cards.py`, `api/recognize.py`) are logged server-side and replaced with generic messages. |
+| 1.12 Hardening | **Partly fixed** | nginx static assets keep the CSP and other security headers (`expires` instead of `add_header`). *Open:* non-root containers, refusing the default `POSTGRES_PASSWORD`. |
+| **New: restore self-deadlock** | **Fixed** | Found during end-to-end testing: the restore request's own DB session (opened by authentication) held a lock on `users`, so `--clean` statements waited until the 120 s timeout. **A full restore through the API never succeeded on a running install** (reproduced on the original code). The session is now released before psql runs; there is a Postgres regression test. |
+| §2 Search | **Partly fixed** | SQLite uses a registered `pc_unaccent()` function instead of 56 nested `REPLACE()` calls, which fixes all 64 failing tests. The `unaccent` probe now uses its own connection instead of rolling back the caller's session. *Open:* `pg_trgm` index or a precomputed search column. |
+| §2 Exchange rates | **Fixed** | Successful lookups are cached per pair for an hour; fallbacks aren't cached. |
+| §2 Other efficiency items | Open | Async image proxy, sync DB in async handlers, pagination, shared TCGdex client, background backups. |
+| §3 Architecture | Open | Single-worker assumptions, Alembic, module size, user-deletion cleanup. |
+| §4 CI | **Fixed** | `.github/workflows/backend.yml` runs the full backend suite, the PostgreSQL 18 integration tests, `pip-audit`, and `npm audit`. |
