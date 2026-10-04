@@ -12,7 +12,7 @@ radius; **Low** = hardening / hygiene.
 
 > **Status:** most findings are fixed on branch
 > `claude/inspiring-hamilton-nhdl7j`. See [§7 Remediation status](#7-remediation-status)
-> for what changed and what remains open.
+> for what changed and [REVIEW_FOLLOW_UPS.md](REVIEW_FOLLOW_UPS.md) for the open backlog.
 
 ---
 
