@@ -236,6 +236,78 @@ class RestoreBackupTests(unittest.IsolatedAsyncioTestCase):
         run_mock.assert_not_called()
         self.assertEqual(self._remaining_files(), [])
 
+    async def test_copy_program_is_rejected_without_running_psql(self):
+        payload = b"COPY restore_marker FROM\n  PROGRAM 'id';\n"
+        backup_dir, params, run = self._patches(subprocess.CompletedProcess([], 0, "", ""))
+        with backup_dir, params, run as run_mock, self.assertRaises(HTTPException) as raised:
+            await backup_api.restore_backup(ChunkedUpload(payload), current_user=self.admin)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        run_mock.assert_not_called()
+        self.assertEqual(self._remaining_files(), [])
+
+    async def test_restore_error_does_not_leak_psql_output(self):
+        completed = subprocess.CompletedProcess([], 1, "", "FATAL: password for host db.internal")
+        backup_dir, params, run = self._patches(completed)
+        with backup_dir, params, run, self.assertRaises(HTTPException) as raised:
+            await backup_api.restore_backup(ChunkedUpload(b"SELECT 1;"), current_user=self.admin)
+
+        self.assertNotIn("db.internal", raised.exception.detail)
+
+
+@unittest.skipUnless(DEPS_AVAILABLE, "FastAPI dependencies are not installed")
+class SanitizeRestoreFileTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.source = Path(self.temp_dir.name) / "in.sql"
+        self.destination = Path(self.temp_dir.name) / "out.sql"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _sanitize(self, payload: bytes) -> list[bytes]:
+        self.source.write_bytes(payload)
+        backup_api._sanitize_restore_file(self.source, self.destination)
+        return self.destination.read_bytes().splitlines()
+
+    def test_script_is_wrapped_in_a_fresh_restrict_key(self):
+        lines = self._sanitize(b"SELECT 1;\n")
+        self.assertTrue(lines[0].startswith(b"\\restrict "))
+        key = lines[0].split(b" ", 1)[1]
+        self.assertEqual(len(key), 32)
+        self.assertEqual(lines[-1], b"\\unrestrict " + key)
+        self.assertIn(b"SELECT 1;", lines)
+
+    def test_pg_dump_restrict_framing_is_replaced(self):
+        lines = self._sanitize(
+            b"\\restrict DumpKey123\nSELECT 1;\n\\unrestrict DumpKey123\n"
+        )
+        self.assertNotIn(b"DumpKey123", b"\n".join(lines))
+
+    def test_copy_data_is_passed_through_verbatim(self):
+        payload = (
+            b"COPY public.cards (id, name) FROM stdin;\n"
+            b"\\N\tcopy and program text\n"
+            b"\\.\n"
+            b"SELECT 1;\n"
+        )
+        lines = self._sanitize(payload)
+        self.assertIn(b"\\N\tcopy and program text", lines)
+        self.assertIn(b"\\.", lines)
+
+    def test_copy_program_outside_data_is_rejected(self):
+        with self.assertRaises(backup_api.UnsafeRestoreError):
+            self._sanitize(b"copy t to program 'curl evil';\n")
+
+    def test_copy_program_hidden_in_fake_copy_data_is_rejected(self):
+        payload = (
+            b"COPY public.cards (id) FROM stdin;\n"
+            b"COPY t FROM PROGRAM 'id';\n"
+            b"\\.\n"
+        )
+        with self.assertRaises(backup_api.UnsafeRestoreError):
+            self._sanitize(payload)
+
 
 if __name__ == "__main__":
     unittest.main()
