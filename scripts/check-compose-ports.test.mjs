@@ -35,7 +35,21 @@ test('backend requires the expected published-port default', () => {
 })
 
 test('backend rejects a fully hardcoded port mapping', () => {
-  const mutated = replaceOnce(compose, '"${BACKEND_PORT:-8000}:8000"', '"8000:8000"')
+  const mutated = replaceOnce(compose, '"${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"', '"8000:8000"')
+
+  assert.ok(checkComposePorts(mutated).length > 0)
+})
+
+test('backend must stay bound to localhost by default', () => {
+  const mutated = replaceOnce(compose, '"${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"', '"${BACKEND_PORT:-8000}:8000"')
+
+  const errors = checkComposePorts(mutated)
+  assert.equal(errors.length, 1)
+  assert.match(errors[0], /BACKEND_BIND/)
+})
+
+test('backend rejects a different default bind address', () => {
+  const mutated = replaceOnce(compose, '${BACKEND_BIND:-127.0.0.1}', '${BACKEND_BIND:-0.0.0.0}')
 
   assert.ok(checkComposePorts(mutated).length > 0)
 })
@@ -49,8 +63,8 @@ test('frontend requires the expected container port', () => {
 test('another published port alongside the parameterised one is accepted', () => {
   const mutated = replaceOnce(
     compose,
-    '      - "${BACKEND_PORT:-8000}:8000"',
-    '      - "9000:9000"\n      - "${BACKEND_PORT:-8000}:8000"',
+    '      - "${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"',
+    '      - "9000:9000"\n      - "${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"',
   )
 
   assert.deepEqual(checkComposePorts(mutated), [])
@@ -59,15 +73,15 @@ test('another published port alongside the parameterised one is accepted', () =>
 test('the mapping only counts inside the service ports list', () => {
   const mutated = replaceOnce(
     compose,
-    '      - "${BACKEND_PORT:-8000}:8000"',
-    '      - "${BACKEND_PORT-8000}:8000"\n    x-port-check:\n      - "${BACKEND_PORT:-8000}:8000"',
+    '      - "${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"',
+    '      - "${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT-8000}:8000"\n    x-port-check:\n      - "${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"',
   )
 
   assert.ok(checkComposePorts(mutated).length > 0)
 })
 
 test('a service-shaped block outside the services section cannot stand in for a service', () => {
-  const decoy = 'x-templates:\n  backend:\n    ports:\n      - "${BACKEND_PORT:-8000}:8000"\n\n'
+  const decoy = 'x-templates:\n  backend:\n    ports:\n      - "${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"\n\n'
 
   // The decoy is ignored and the real services still satisfy the check.
   assert.deepEqual(checkComposePorts(decoy + compose), [])

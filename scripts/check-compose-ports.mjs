@@ -7,6 +7,9 @@ const portMappings = [
   {
     service: 'backend',
     variable: 'BACKEND_PORT',
+    // Bound to localhost by default so clients use the frontend proxy, which
+    // forwards the real client address the backend trusts for rate limiting.
+    bind: '${BACKEND_BIND:-127.0.0.1}',
     published: '${BACKEND_PORT:-8000}',
     unsafePublished: '${BACKEND_PORT-8000}',
     container: '8000',
@@ -100,11 +103,21 @@ export function checkComposePorts(compose) {
       continue
     }
 
-    if (entries.includes(`"${mapping.published}:${mapping.container}"`)) {
+    const prefix = mapping.bind ? `${mapping.bind}:` : ''
+    const expected = `"${prefix}${mapping.published}:${mapping.container}"`
+
+    if (entries.includes(expected)) {
       continue
     }
 
-    if (entries.includes(`"${mapping.unsafePublished}:${mapping.container}"`)) {
+    if (mapping.bind && entries.includes(`"${mapping.published}:${mapping.container}"`)) {
+      errors.push(
+        `${mapping.service} must bind its published port with ${mapping.bind}; publishing on all interfaces bypasses the frontend proxy and lets clients spoof X-Forwarded-For`,
+      )
+      continue
+    }
+
+    if (entries.includes(`"${prefix}${mapping.unsafePublished}:${mapping.container}"`)) {
       errors.push(
         `${mapping.service} must use ${mapping.published}:${mapping.container}; ${mapping.unsafePublished} is wrong because an empty variable loses the stable default host port and may receive an ephemeral one`,
       )
@@ -112,7 +125,7 @@ export function checkComposePorts(compose) {
     }
 
     errors.push(
-      `Expected ${mapping.service} to publish "${mapping.published}:${mapping.container}" in its ports list, in quoted short syntax`,
+      `Expected ${mapping.service} to publish ${expected} in its ports list, in quoted short syntax`,
     )
   }
 

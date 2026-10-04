@@ -54,6 +54,11 @@ services:
       OPENAI_API_KEY_REQUIRED: ${OPENAI_API_KEY_REQUIRED:-}
       TCGDEX_SYNC_LANGUAGES: ${TCGDEX_SYNC_LANGUAGES:-en,de}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # uvicorn takes the client address from X-Forwarded-For only for these
+      # peers (the bundled nginx on the compose network). Rate limits rely on it.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      RATE_LIMIT_DEFAULT: ${RATE_LIMIT_DEFAULT:-600/minute}
+      RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-5/minute}
       PRE_UPGRADE_BACKUP_ENABLED: ${PRE_UPGRADE_BACKUP_ENABLED:-true}
       PRE_UPGRADE_BACKUP_REQUIRED: ${PRE_UPGRADE_BACKUP_REQUIRED:-true}
       PRE_UPGRADE_BACKUP_KEEP: ${PRE_UPGRADE_BACKUP_KEEP:-10}
@@ -74,8 +79,11 @@ services:
       - ./data/pokedex-images:/app/data/pokedex-images
       - ./data/scan-uploads:/app/data/scan-uploads
       - ./data/scan-traces:/app/data/scan-traces
+    # Published on localhost only: browsers and other clients go through the
+    # frontend's nginx (security headers, upload limits, client-IP forwarding).
+    # Exposing this port more widely would let clients spoof X-Forwarded-For.
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      - "${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
 
   frontend:
     image: ghcr.io/git-romer/pokecollector-frontend:${POKECOLLECTOR_VERSION:-1.51.0}

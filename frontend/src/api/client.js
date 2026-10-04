@@ -5,11 +5,17 @@ import {
   scannerTestRequestTimeoutMs,
 } from '../utils/scannerTimeout'
 
+// The backend rejects unsafe requests that carry neither a bearer token nor this
+// header, so a cross-site page cannot drive the API through ambient credentials
+// (single-user mode or reverse-proxy cookies). See require_csrf_header in main.py.
+export const CSRF_HEADERS = { 'X-Requested-With': 'pokecollector' }
+
 const api = axios.create({
   baseURL: '/api',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
+    ...CSRF_HEADERS,
   },
 })
 
@@ -62,8 +68,16 @@ export const getUsers = () => api.get('/auth/users').then(r => r.data)
 export const createUser = (data) => api.post('/auth/users', data).then(r => r.data)
 export const updateUser = (id, data) => api.put(`/auth/users/${id}`, data).then(r => r.data)
 export const deleteUser = (id) => api.delete(`/auth/users/${id}`).then(r => r.data)
-export const changePassword = (data) => api.put('/auth/me/password', data).then(r => r.data)
-export const forceChangePassword = (newPassword) => api.put('/auth/me/force-password', { new_password: newPassword }).then(r => r.data)
+// Changing a password signs out every existing session, including this one, and
+// returns a replacement token for the current browser.
+export function storeRotatedToken(data) {
+  if (data?.access_token && localStorage.getItem('token')) {
+    localStorage.setItem('token', data.access_token)
+  }
+  return data
+}
+export const changePassword = (data) => api.put('/auth/me/password', data).then(r => storeRotatedToken(r.data))
+export const forceChangePassword = (newPassword) => api.put('/auth/me/force-password', { new_password: newPassword }).then(r => storeRotatedToken(r.data))
 export const changeAvatar = (avatarId) => api.put('/auth/me/avatar', { avatar_id: avatarId }).then(r => r.data)
 export const changeUsername = (username) => api.put('/auth/me/username', { username }).then(r => r.data)
 
