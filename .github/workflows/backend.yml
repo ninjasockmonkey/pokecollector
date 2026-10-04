@@ -38,9 +38,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      DATA_DIR: ${{ runner.temp }}/pokecollector-data
-      JWT_SECRET_FILE: ${{ runner.temp }}/pokecollector-data/jwt_secret.key
     steps:
       - name: Checkout repository
         shell: bash
@@ -54,6 +51,12 @@ jobs:
           echo "::add-mask::${auth_header}"
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: Basic ${auth_header}" fetch --force origin "${GITHUB_REF}"
           git checkout --detach FETCH_HEAD
+
+      - name: Configure test data directory
+        # The runner context is not available in job-level env, so export here.
+        run: |
+          echo "DATA_DIR=${RUNNER_TEMP}/pokecollector-data" >> "$GITHUB_ENV"
+          echo "JWT_SECRET_FILE=${RUNNER_TEMP}/pokecollector-data/jwt_secret.key" >> "$GITHUB_ENV"
 
       - name: Install PostgreSQL 18 client tools
         # pg_dump refuses to dump a newer server, so match the server's major version.
