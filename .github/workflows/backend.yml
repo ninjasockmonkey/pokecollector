@@ -1,0 +1,111 @@
+name: Backend
+
+on:
+  pull_request:
+    paths:
+      - backend/**
+      - docker-compose.yml
+      - .github/workflows/backend.yml
+  push:
+    branches:
+      - main
+    paths:
+      - backend/**
+      - docker-compose.yml
+      - .github/workflows/backend.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: pokemon
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: pokemon_tcg
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pokemon -d pokemon_tcg"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATA_DIR: ${{ runner.temp }}/pokecollector-data
+      JWT_SECRET_FILE: ${{ runner.temp }}/pokecollector-data/jwt_secret.key
+    steps:
+      - name: Checkout repository
+        shell: bash
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
+          echo "::add-mask::${auth_header}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: Basic ${auth_header}" fetch --force origin "${GITHUB_REF}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Install PostgreSQL 18 client tools
+        # pg_dump refuses to dump a newer server, so match the server's major version.
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Install Python dependencies
+        run: |
+          python3 --version
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          echo "${RUNNER_TEMP}/venv/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/venv/bin/pip" install --quiet -r requirements.txt pytest pip-audit
+
+      - name: Run unit tests
+        run: python -m pytest -q -p no:cacheprovider
+
+      - name: Run PostgreSQL integration tests
+        env:
+          DATABASE_URL: postgresql://pokemon:ci-only-password@localhost:5432/pokemon_tcg
+          BACKUP_POSTGRES_TEST: "1"
+          CARD_LISTS_POSTGRES_TEST: "1"
+          SCAN_QUEUE_POSTGRES_TEST: "1"
+        run: |
+          pg_dump --version
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_backup_postgres.py \
+            tests/test_card_lists_postgres.py \
+            tests/test_scan_queue_postgres.py
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth_header="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
+          echo "::add-mask::${auth_header}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: Basic ${auth_header}" fetch --force origin "${GITHUB_REF}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Audit Python dependencies
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/audit"
+          "${RUNNER_TEMP}/audit/bin/pip" install --quiet pip-audit
+          "${RUNNER_TEMP}/audit/bin/pip-audit" -r backend/requirements.txt
+
+      - name: Audit production npm dependencies
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high
