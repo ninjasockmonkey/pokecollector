@@ -1,4 +1,5 @@
 import logging
+import time
 import os
 import re
 from urllib.parse import urlsplit, urlunsplit
@@ -221,6 +222,22 @@ def _apply_setting_side_effect(db: Session, key: str, value: str) -> None:
             result["sets_marked"],
             result["cards_marked"],
         )
+
+
+# Generic setting endpoints only store keys the application knows about, with a
+# bounded size, so they cannot be used as free-form per-user storage.
+MAX_SETTING_VALUE_LENGTH = 64 * 1024
+
+
+def _writable_setting_keys() -> set[str]:
+    return PER_USER_KEYS | ADMIN_ONLY_KEYS | set(DEFAULT_SETTINGS)
+
+
+def _refuse_unknown_setting(key: str, value) -> None:
+    if key not in _writable_setting_keys():
+        raise HTTPException(status_code=400, detail=f"Unknown setting: {key[:64]}")
+    if value is not None and len(str(value)) > MAX_SETTING_VALUE_LENGTH:
+        raise HTTPException(status_code=413, detail=f"Setting {key} is too large")
 
 
 def _is_admin(db: Session, user_id: int) -> bool:
@@ -703,6 +720,7 @@ def update_settings(data: dict, db: Session = Depends(get_db), current_user: Use
     pending_side_effects = []
     for key, value in data.items():
         _refuse_dedicated_setting(key)
+        _refuse_unknown_setting(key, value)
         coerced_value = _coerce_setting_value(key, value)
         if key in ADMIN_ONLY_KEYS:
             if current_user.role != "admin":
@@ -781,6 +799,13 @@ def get_telegram_status(db: Session = Depends(get_db), current_user: User = Depe
     return {"configured": bool(token and chat_id)}
 
 
+# Frankfurter publishes reference rates once per working day; caching per pair
+# avoids an upstream round trip on every page load. Fallback rates are not cached
+# so a transient outage recovers on the next request.
+_EXCHANGE_RATE_TTL_SECONDS = 60 * 60
+_exchange_rate_cache: dict[tuple[str, str], tuple[float, float]] = {}
+
+
 @router.get("/exchange-rate")
 def get_exchange_rate(
     from_currency: str = Query(alias="from"),
@@ -796,6 +821,10 @@ def get_exchange_rate(
     if source == target:
         return {"from": source, "to": target, "rate": fallback_rate, "fallback": False}
 
+    cached = _exchange_rate_cache.get((source, target))
+    if cached and time.monotonic() - cached[1] < _EXCHANGE_RATE_TTL_SECONDS:
+        return {"from": source, "to": target, "rate": cached[0], "fallback": False}
+
     try:
         response = httpx.get(
             f"https://api.frankfurter.dev/v2/rate/{source}/{target}",
@@ -803,6 +832,7 @@ def get_exchange_rate(
         )
         response.raise_for_status()
         rate = parse_frankfurter_v2_rate(response.json())
+        _exchange_rate_cache[(source, target)] = (rate, time.monotonic())
         return {"from": source, "to": target, "rate": rate, "fallback": False}
     except Exception as exc:
         logger.warning("Failed to fetch exchange rate %s to %s: %s", source, target, exc)
@@ -834,6 +864,7 @@ def set_setting(key: str, body: dict, db: Session = Depends(get_db), current_use
             detail="Use the atomic scanner configuration endpoint for scanner settings.",
         )
     _refuse_dedicated_setting(key)
+    _refuse_unknown_setting(key, body.get("value", ""))
     value = _coerce_setting_value(key, body.get("value", ""))
     if key in ADMIN_ONLY_KEYS:
         if current_user.role != "admin":

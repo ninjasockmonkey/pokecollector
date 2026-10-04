@@ -224,6 +224,22 @@ class CustomCardOwnershipTests(unittest.TestCase):
         )
         self.assertEqual(visible, [])
 
+    def test_other_trainers_do_not_see_purchase_prices(self):
+        self.db.add(Card(id="sv1-1_en", tcg_card_id="sv1-1", name="Sprigatito", set_id="sv1", number="1", lang="en"))
+        self.db.commit()
+        add_to_collection(
+            CollectionItemCreate(card_id="sv1-1_en", quantity=1, lang="en", purchase_price=12.5),
+            current_user=self.owner,
+            db=self.db,
+        )
+
+        seen_by_other = get_user_collection(self.owner.id, current_user=self.other, db=self.db)
+        self.assertEqual([item.card_id for item in seen_by_other], ["sv1-1_en"])
+        self.assertIsNone(seen_by_other[0].purchase_price)
+
+        seen_by_owner = get_user_collection(self.owner.id, current_user=self.owner, db=self.db)
+        self.assertEqual(seen_by_owner[0].purchase_price, 12.5)
+
     def test_dashboard_marks_manual_cards_for_homepage_badges(self):
         private_card = self._create()
         add_to_collection(
