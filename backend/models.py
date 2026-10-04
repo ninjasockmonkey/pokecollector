@@ -160,6 +160,9 @@ class User(Base):
     public_show_values = Column(Boolean, default=False, nullable=False)
     wishlist_visibility = Column(String, default="private", nullable=False)
     must_change_password = Column(Boolean, default=False)
+    # Incremented whenever existing sessions must stop working (password, role,
+    # or activation changes). Access tokens carry the value they were issued with.
+    token_version = Column(Integer, default=0, nullable=False, server_default="0")
     created_at = Column(DateTime, default=func.now())
 
 
