@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import sqlite3
 import unicodedata
 
-from sqlalchemy import case, func, literal, or_, select, text
+from sqlalchemy import case, event, func, literal, or_, select, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 # Keep a small per-engine cache so PostgreSQL extension probing is cheap and so
@@ -64,6 +66,23 @@ def _portable_unaccent_value(value: str) -> str:
     return normalized
 
 
+_SQLITE_UNACCENT_FUNCTION = "pc_unaccent"
+
+
+def _sqlite_unaccent(value):
+    return None if value is None else _portable_unaccent_value(str(value))
+
+
+@event.listens_for(Engine, "connect")
+def _register_sqlite_unaccent(dbapi_connection, _connection_record):
+    # SQLite cannot evaluate the nested REPLACE() chain (56 levels exceed its
+    # parser stack), so it gets the same normalisation as a native function.
+    if isinstance(dbapi_connection, sqlite3.Connection):
+        dbapi_connection.create_function(
+            _SQLITE_UNACCENT_FUNCTION, 1, _sqlite_unaccent, deterministic=True
+        )
+
+
 def _postgres_unaccent_available(db: Session) -> bool:
     bind = db.get_bind()
     if bind.dialect.name != "postgresql":
@@ -73,11 +92,13 @@ def _postgres_unaccent_available(db: Session) -> bool:
     if cache_key in _UNACCENT_AVAILABLE_BY_BIND:
         return _UNACCENT_AVAILABLE_BY_BIND[cache_key]
 
+    # Probe on a separate connection: a failed statement inside the request's
+    # session would otherwise force a rollback of the caller's pending work.
     try:
-        db.execute(text("SELECT unaccent('Pokégear')")).scalar()
+        with getattr(bind, "engine", bind).connect() as connection:
+            connection.execute(text("SELECT unaccent('Pokégear')")).scalar()
         available = True
     except Exception:
-        db.rollback()
         available = False
 
     _UNACCENT_AVAILABLE_BY_BIND[cache_key] = available
@@ -100,7 +121,10 @@ def accent_insensitive_contains(db: Session, column, value: str | None):
     normalized = _portable_unaccent_value(value)
     if not normalized:
         return None
-    return _portable_unaccent_expr(column).like(f"%{_escape_like(normalized)}%", escape="\\")
+    pattern = f"%{_escape_like(normalized)}%"
+    if db.get_bind().dialect.name == "sqlite":
+        return getattr(func, _SQLITE_UNACCENT_FUNCTION)(column).like(pattern, escape="\\")
+    return _portable_unaccent_expr(column).like(pattern, escape="\\")
 
 
 def json_array_text_matches(db: Session, column, fields: tuple[str, ...], value: str):

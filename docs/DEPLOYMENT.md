@@ -79,7 +79,8 @@ docker compose pull
 docker compose up -d
 ```
 
-Confirm that the services are running and the backend responds. Replace port
+Confirm that the services are running and the backend responds. Run this on
+the Docker host (the backend port is bound to `127.0.0.1`), and replace port
 `8000` if `BACKEND_PORT` is customized:
 
 ```bash
@@ -156,3 +157,18 @@ Normal future releases require no package-visibility interaction. Repository
 Actions permissions and public GHCR package visibility are persistent settings.
 Intervention is only expected after a build/release failure, a change to the
 external Actions allowlist, or another explicit infrastructure change.
+
+## Running behind another reverse proxy
+
+The bundled nginx overwrites `X-Forwarded-For` with the address that connected
+to it, and the backend uses that address for per-client rate limits. If Traefik,
+Caddy, or another proxy sits in front of the frontend container, every request
+appears to come from that proxy, and all users share one budget. Configure
+[`ngx_http_realip_module`](https://nginx.org/en/docs/http/ngx_http_realip_module.html)
+in `frontend/nginx.conf` (`set_real_ip_from <proxy address>;`
+`real_ip_header X-Forwarded-For;`) so `$remote_addr` is the real client, or
+raise `RATE_LIMIT_DEFAULT` and `RATE_LIMIT_LOGIN`.
+
+API clients that call a **single-user** install without a bearer token must
+send an `X-Requested-With` header on `POST`, `PUT`, and `DELETE` requests (see
+"HTTP Security Boundaries" in `ARCHITECTURE.md`).

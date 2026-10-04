@@ -14,6 +14,8 @@ try:
     import psycopg2
     from psycopg2 import sql
     from fastapi import HTTPException
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import sessionmaker
 
     from api import backup as backup_api
     from services.postgres_cli import parse_database_url
@@ -155,6 +157,50 @@ class BackupPostgresTests(unittest.TestCase):
             [path for path in Path(self.temp_dir.name).iterdir() if path.name.startswith("restore_")],
             [],
         )
+
+    def test_restore_releases_the_requests_own_session_before_psql_runs(self):
+        backup_dir, params = self._api_patches()
+        with backup_dir, params:
+            dump_bytes = Path(
+                backup_api.download_backup(include="full", current_user=self.admin).path
+            ).read_bytes()
+
+            # Authenticating a real request leaves a transaction open that holds
+            # locks; the --clean DROP statements would otherwise wait on it.
+            engine = create_engine(
+                "postgresql://{user}:{password}@{host}:{port}/{dbname}".format(**self.params)
+            )
+            session = sessionmaker(bind=engine)()
+            session.execute(text("SELECT * FROM restore_marker")).all()
+            try:
+                result = asyncio.run(
+                    backup_api.restore_backup(
+                        ChunkedUpload(dump_bytes), current_user=self.admin, db=session
+                    )
+                )
+            finally:
+                session.close()
+                engine.dispose()
+
+        self.assertEqual(result, {"message": "Database restored successfully"})
+
+    def test_psql_meta_commands_are_rejected_before_any_statement_runs(self):
+        marker = Path(self.temp_dir.name) / "shell-ran"
+        hostile_dump = (
+            b"DELETE FROM restore_marker;\n"
+            b"SELECT 1 \\! touch " + str(marker).encode() + b"\n;\n"
+        )
+        backup_dir, params = self._api_patches()
+        with backup_dir, params, self.assertRaises(HTTPException) as raised:
+            asyncio.run(
+                backup_api.restore_backup(ChunkedUpload(hostile_dump), current_user=self.admin)
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertFalse(marker.exists())
+        with self._connect(self.params) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT value FROM restore_marker")
+            self.assertEqual(cursor.fetchone()[0], "from-backup")
 
 
 if __name__ == "__main__":

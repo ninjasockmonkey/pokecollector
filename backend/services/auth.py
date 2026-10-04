@@ -8,7 +8,8 @@ import tempfile
 from datetime import datetime, timedelta
 
 import bcrypt
-from jose import JWTError, jwt
+import jwt
+from jwt import InvalidTokenError as JWTError
 from sqlalchemy.orm import Session
 
 from models import User, UserSetting
@@ -108,12 +109,49 @@ def secret_fingerprint(namespace: str, material: str) -> str:
     return hmac.new(SECRET_KEY.encode(), scoped, hashlib.sha256).hexdigest()
 
 
+MIN_PASSWORD_LENGTH = 8
+# bcrypt only uses the first 72 bytes and bcrypt>=5 raises for longer input.
+MAX_PASSWORD_BYTES = 72
+
+
+class PasswordPolicyError(ValueError):
+    """A new password does not meet the minimum requirements."""
+
+
+def validate_new_password(password: str | None) -> str:
+    if password is None or len(password) < MIN_PASSWORD_LENGTH:
+        raise PasswordPolicyError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        raise PasswordPolicyError(f"Password must be at most {MAX_PASSWORD_BYTES} bytes")
+    return password
+
+
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    encoded = password.encode("utf-8")
+    if len(encoded) > MAX_PASSWORD_BYTES:
+        raise PasswordPolicyError(f"Password must be at most {MAX_PASSWORD_BYTES} bytes")
+    return bcrypt.hashpw(encoded, bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+    encoded = (plain_password or "").encode("utf-8")
+    if len(encoded) > MAX_PASSWORD_BYTES:
+        # Never stored (hash_password refuses it), so it cannot match; bcrypt>=5
+        # would raise instead of returning False.
+        return False
+    try:
+        return bcrypt.checkpw(encoded, hashed_password.encode("utf-8"))
+    except ValueError:
+        return False
+
+
+# Spend the same bcrypt work for unknown usernames so response timing does not
+# reveal which accounts exist.
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"pokecollector-timing-equalizer", bcrypt.gensalt()).decode("utf-8")
+
+
+def burn_password_check(plain_password: str) -> None:
+    verify_password(plain_password, _DUMMY_PASSWORD_HASH)
 
 
 def create_access_token(data: dict, expires_delta: timedelta = None) -> str:

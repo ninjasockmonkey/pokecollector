@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func, cast, Integer, String, or_
@@ -41,6 +42,7 @@ import datetime
 import re
 from uuid import uuid4
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Pattern: an alphanumeric set code beginning with a letter, then a numeric card
@@ -389,7 +391,8 @@ def create_custom_card(
         db.refresh(card)
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error in %s", __name__)
+        raise HTTPException(status_code=500, detail="Internal server error; see the server log for details") from None
 
     return _card_to_dict(card, current_user.id)
 
@@ -518,7 +521,8 @@ def delete_custom_card(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error in %s", __name__)
+        raise HTTPException(status_code=500, detail="Internal server error; see the server log for details") from None
 
     return {"message": "Custom card deleted"}
 
@@ -758,7 +762,8 @@ def search_cards(
             "page_size": page_size,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error in %s", __name__)
+        raise HTTPException(status_code=500, detail="Internal server error; see the server log for details") from None
 
 
 @router.get("/custom/matches")
@@ -895,7 +900,8 @@ def migrate_custom_card(
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to load API card: {e}")
+        logger.exception("Unhandled error in %s", __name__)
+        raise HTTPException(status_code=500, detail="Failed to load API card; see the server log for details") from None
 
     # 2. Re-assign collection items
     try:
@@ -1016,7 +1022,8 @@ def migrate_custom_card(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Migration failed: {e}")
+        logger.exception("Unhandled error in %s", __name__)
+        raise HTTPException(status_code=500, detail="Migration failed; see the server log for details") from None
 
     return {"status": "migrated", "api_card_id": composite_api_card_id}
 
@@ -1047,7 +1054,8 @@ def dismiss_custom_match(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error in %s", __name__)
+        raise HTTPException(status_code=500, detail="Internal server error; see the server log for details") from None
 
     return {"status": "dismissed"}
 
@@ -1231,4 +1239,5 @@ def get_card(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error in %s", __name__)
+        raise HTTPException(status_code=500, detail="Internal server error; see the server log for details") from None

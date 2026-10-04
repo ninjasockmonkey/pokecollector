@@ -1,5 +1,5 @@
-fastapi==0.109.2
-uvicorn[standard]==0.27.1
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
 sqlalchemy==2.0.27
 psycopg2-binary==2.9.9
 python-dotenv==1.2.2
@@ -8,12 +8,12 @@ apscheduler==3.10.4
 reportlab==4.1.0
 pandas==2.2.0
 numpy==1.26.4
-python-multipart==0.0.31
+python-multipart==0.0.32
 aiofiles==23.2.1
 openpyxl==3.1.2
 pillow==12.3.0
 pillow-heif>=0.20.0,<2
 alembic==1.13.1
-bcrypt
-python-jose[cryptography]
-slowapi==0.1.9
+bcrypt==5.0.0
+PyJWT==2.15.1
+limits==5.8.0

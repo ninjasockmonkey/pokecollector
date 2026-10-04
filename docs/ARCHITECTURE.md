@@ -12,7 +12,7 @@ This document reflects the current code layout at the repository root.
 | External APIs | TCGdex, Gemini or OpenAI-compatible scanner, Frankfurter, GitHub, PokéCollector supporter registry | external |
 | Containerization | Docker + docker compose | - |
 
-The table lists the default published host ports, set with `FRONTEND_PORT` and `BACKEND_PORT`. Inside the Compose network the frontend listens on `80`, the backend on `8000`, and PostgreSQL on `5432` without being published.
+The table lists the default published host ports, set with `FRONTEND_PORT` and `BACKEND_PORT`. The backend port is bound to `127.0.0.1` (`BACKEND_BIND`), so other machines reach the API only through the frontend's nginx. Inside the Compose network the frontend listens on `80`, the backend on `8000`, and PostgreSQL on `5432` without being published.
 
 ## Directory Structure
 
@@ -369,3 +369,26 @@ publication. See [`DEPLOYMENT.md`](DEPLOYMENT.md).
 Schema changes are handled by idempotent SQL in `backend/database.py`, not Alembic.
 
 Some migration comments still mention historical features, but the current runtime architecture does not include eBay integration and does not expose grading in the active UI or ORM model.
+
+## HTTP Security Boundaries
+
+- **CSRF guard.** Unsafe requests (`POST`/`PUT`/`DELETE`) to `/api/*` without a
+  `Authorization: Bearer` token must send `X-Requested-With`. The SPA sets it on every
+  request. This stops cross-site pages from driving the API through ambient
+  credentials (single-user mode or reverse-proxy cookies), because the header
+  forces a CORS preflight. Bearer-token clients are unaffected. Scripts that call
+  a single-user install without a token must add the header. `/api/auth/login`
+  is exempt.
+- **CORS.** None by default (same origin). See `CORS_ORIGINS`.
+- **Rate limits.** `services/rate_limit.py` applies a per-client budget to every
+  `/api/*` path except images and health, plus a stricter login budget. Client
+  addresses come from nginx's `X-Forwarded-For`, trusted only from
+  `FORWARDED_ALLOW_IPS`. State is in-process, so run one uvicorn worker.
+- **Sessions.** Access tokens carry a `tv` claim matched against
+  `users.token_version`. Password changes, admin resets, role changes, and
+  deactivation increment it, which signs out existing sessions.
+  `must_change_password` is enforced by the API, not just the UI.
+- **Restore.** Uploaded SQL runs through `psql` inside `\restrict` mode with a
+  random key, so psql meta-commands such as `\!` are refused. `COPY ... PROGRAM`
+  is rejected before psql starts. Restore still runs as the database owner, so
+  it remains an administrator-only, fully trusted operation.

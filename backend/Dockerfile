@@ -29,4 +29,8 @@ RUN mkdir -p /app/backups /app/debug /app/data/pokedex-images/sprites /app/data/
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Trust X-Forwarded-For only from loopback and private networks (the bundled
+# nginx). uvicorn reads this variable for --forwarded-allow-ips.
+ENV FORWARDED_ALLOW_IPS="127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

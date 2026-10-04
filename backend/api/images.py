@@ -24,6 +24,9 @@ _client = httpx.Client(timeout=15, follow_redirects=True)
 _custom_image_client = httpx.Client(timeout=10, follow_redirects=False)
 _SET_FALLBACK_IMAGE = Path(__file__).resolve().parents[1] / "static" / "pokemon-logo.svg"
 _MAX_CUSTOM_IMAGE_BYTES = 8 * 1024 * 1024
+# Catalogue artwork is a few hundred KB; anything far larger is not an image we
+# want to keep in the database cache.
+_MAX_UPSTREAM_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_CUSTOM_IMAGE_REDIRECTS = 3
 _ALLOWED_CUSTOM_IMAGE_TYPES = {
     "image/avif",
@@ -32,6 +35,39 @@ _ALLOWED_CUSTOM_IMAGE_TYPES = {
     "image/png",
     "image/webp",
 }
+
+
+# Proxied bytes come from third parties. Even an allowed raster type must never be
+# interpreted as a document in the app's origin (for example if a browser opens
+# the URL directly), so every image response is sandboxed and never sniffed.
+_IMAGE_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+}
+
+
+def _sniff_raster_type(data: bytes) -> str | None:
+    """Identify an allowed raster format from its magic bytes (CDNs often send
+    application/octet-stream). Anything else, notably SVG or HTML, is refused."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
+        return "image/avif"
+    return None
+
+
+def _image_response(data: bytes, content_type: str, cache_control: str) -> Response:
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Cache-Control": cache_control, **_IMAGE_SECURITY_HEADERS},
+    )
 
 
 def _setting_enabled(db: Session, key: str, default: bool = True) -> bool:
@@ -89,14 +125,27 @@ def _get_or_fetch(db: Session, key: str, url: str) -> tuple[bytes, str]:
     if cached:
         return cached.data, cached.content_type
 
+    chunks: list[bytes] = []
+    total = 0
     try:
-        resp = _client.get(url)
-        resp.raise_for_status()
+        with _client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            declared_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            for chunk in resp.iter_bytes():
+                total += len(chunk)
+                if total > _MAX_UPSTREAM_IMAGE_BYTES:
+                    raise HTTPException(status_code=502, detail="Upstream image is too large")
+                chunks.append(chunk)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Failed to fetch image from upstream") from exc
 
-    content_type = resp.headers.get("content-type", "image/webp")
-    entry = ImageCache(image_key=key, data=resp.content, content_type=content_type)
+    data = b"".join(chunks)
+    content_type = declared_type if declared_type in _ALLOWED_CUSTOM_IMAGE_TYPES else _sniff_raster_type(data)
+    if content_type is None:
+        raise HTTPException(status_code=502, detail="Upstream returned an unsupported image type")
+    entry = ImageCache(image_key=key, data=data, content_type=content_type)
     db.add(entry)
     try:
         db.commit()
@@ -107,7 +156,7 @@ def _get_or_fetch(db: Session, key: str, url: str) -> tuple[bytes, str]:
             return cached.data, cached.content_type
         raise
 
-    return resp.content, content_type
+    return data, content_type
 
 
 def _get_or_fetch_custom_image(
@@ -208,17 +257,18 @@ def get_card_image(
                 allowed_content_types=_ALLOWED_CUSTOM_IMAGE_TYPES,
             )
         elif card.custom_image_url and url == card.custom_image_url:
-            data, content_type = _get_or_fetch_custom_image(db, f"card:{card_id}:{size}:custom", url)
+            data, content_type = _get_or_fetch_custom_image(
+                db,
+                f"card:{card_id}:{size}:custom",
+                url,
+                allowed_content_types=_ALLOWED_CUSTOM_IMAGE_TYPES,
+            )
         else:
             url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()
             data, content_type = _get_or_fetch(db, f"card:{card_id}:{size}:{url_hash}", url)
     except (HTTPException, ValueError):
         return _card_back_response()
-    return Response(
-        content=data,
-        media_type=content_type,
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+    return _image_response(data, content_type, "public, max-age=86400")
 
 
 @router.get("/set/{set_id}/{image_type}")
@@ -256,11 +306,7 @@ def get_set_image(set_id: str, image_type: str, db: Session = Depends(get_db)):
         if exc.status_code == 502:
             return _set_fallback_response()
         raise
-    return Response(
-        content=data,
-        media_type=content_type,
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+    return _image_response(data, content_type, "public, max-age=86400")
 
 
 @router.get("/product/{product_id}")
@@ -288,11 +334,4 @@ def get_product_image(
         )
     except (HTTPException, ValueError):
         return _card_back_response()
-    return Response(
-        content=data,
-        media_type=content_type,
-        headers={
-            "Cache-Control": "private, no-cache",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+    return _image_response(data, content_type, "private, no-cache")

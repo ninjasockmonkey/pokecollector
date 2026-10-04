@@ -2,10 +2,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 import logging
 import os
 import time
@@ -17,8 +13,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Rate limiter: uses client IP, default 60 requests/minute
-limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+from services.rate_limit import DEFAULT_RATE_LIMIT, ApiRateLimiter
+
+# Per-client budgets: a generous default for every API route (images exempt) and
+# a strict one for login attempts. See services/rate_limit.py.
+limiter = ApiRateLimiter()
+
+# Unsafe methods that carry no Authorization header rely on ambient credentials:
+# single-user mode (no login at all) or cookies set by an authenticating reverse
+# proxy. A cross-site page can send such requests without a CORS preflight when
+# they use a "simple" content type (form, multipart, text/plain), which would let
+# any website the user visits drive the API, including database restore. Requiring
+# a custom header forces a preflight, which the browser only passes for allowed
+# origins. Bearer-token clients are unaffected. Only *Bearer* tokens count as
+# explicit credentials: browsers attach HTTP Basic credentials (for example from
+# a reverse proxy) to cross-site requests automatically.
+CSRF_HEADER = "x-requested-with"
+CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+CSRF_EXEMPT_PATHS = {"/api/auth/login"}
+
+
+def cors_settings(raw: str | None) -> dict | None:
+    """Translate CORS_ORIGINS into CORSMiddleware options, or None for same-origin only.
+
+    The bundled nginx serves the SPA and the API from one origin, so no CORS
+    headers are needed by default. Explicit origins may send credentials; a
+    wildcard never may, because Starlette would then reflect any Origin.
+    """
+    origins = [origin.strip() for origin in (raw or "").split(",") if origin.strip()]
+    if not origins:
+        return None
+    allow_all = "*" in origins
+    return {
+        "allow_origins": ["*"] if allow_all else origins,
+        "allow_credentials": not allow_all,
+        "allow_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Authorization", "Content-Type", "X-Requested-With"],
+    }
 
 
 def read_app_version() -> str:
@@ -100,9 +131,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(SlowAPIMiddleware)
+
+@app.middleware("http")
+async def require_csrf_header(request: Request, call_next):
+    if (
+        request.method not in CSRF_SAFE_METHODS
+        and request.url.path.startswith("/api/")
+        and request.url.path not in CSRF_EXEMPT_PATHS
+        and not request.headers.get("authorization", "").lower().startswith("bearer ")
+        and CSRF_HEADER not in request.headers
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Missing X-Requested-With header"},
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -113,13 +156,9 @@ async def prevent_failed_public_response_caching(request: Request, call_next):
     return response
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "").split(",") if os.environ.get("CORS_ORIGINS") else ["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
+_cors = cors_settings(os.environ.get("CORS_ORIGINS"))
+if _cors is not None:
+    app.add_middleware(CORSMiddleware, **_cors)
 
 
 
@@ -154,32 +193,14 @@ from api.recognize import router as recognize_router
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 
-# Strict rate limit on login: 5 attempts per minute per IP
 @app.middleware("http")
-async def login_rate_limit(request: Request, call_next):
-    if request.url.path == "/api/auth/login" and request.method == "POST":
-        client_ip = get_remote_address(request)
-        # Use in-memory counter
-        import time
-        now = time.time()
-        if not hasattr(app.state, "_login_attempts"):
-            app.state._login_attempts = {}
-        attempts = app.state._login_attempts
-        # Clean old entries
-        attempts = {k: v for k, v in attempts.items() if now - v[-1] < 60}
-        app.state._login_attempts = attempts
-        # Check this IP
-        ip_attempts = attempts.get(client_ip, [])
-        ip_attempts = [t for t in ip_attempts if now - t < 60]
-        if len(ip_attempts) >= 5:
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Too many login attempts. Try again in 1 minute."},
-            )
-        ip_attempts.append(now)
-        attempts[client_ip] = ip_attempts
+async def rate_limit(request: Request, call_next):
+    limited = limiter.check(request)
+    if limited is not None:
+        return limited
     return await call_next(request)
+
+
 app.include_router(cards.router, prefix="/api/cards", tags=["cards"])
 app.include_router(recognize_router, prefix="/api/cards", tags=["recognize"])
 app.include_router(scan_jobs.router, prefix="/api/cards", tags=["scan-jobs"])

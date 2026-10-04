@@ -554,7 +554,17 @@ def get_user_collection(
         # binders and template browser.
         visible_card_filter(db, user_id, "all"),
     )
-    return _annotate_standard_legality(query.all(), _collection_standard_legal_fingerprints(db))
+    items = _annotate_standard_legality(query.all(), _collection_standard_legal_fingerprints(db))
+    if user_id == current_user.id:
+        return items
+    # What someone paid for their cards is private financial data; other trainers
+    # see what is owned, not purchase prices or which products it came from.
+    return [
+        CollectionItemResponse.model_validate(item).model_copy(
+            update={"purchase_price": None, "product_sources": []}
+        )
+        for item in items
+    ]
 
 
 @router.get("/", response_model=List[CollectionItemResponse])

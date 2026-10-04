@@ -3,6 +3,7 @@ import en from '../i18n/en'
 import { priceFieldFromPrimary } from '../utils/prices'
 import { normalizeTcgdexLanguageCsv } from '../utils/tcgdexLanguages'
 import { useAuth } from './AuthContext'
+import { CSRF_HEADERS } from '../api/client'
 
 const TRANSLATION_LOADERS = {
   de: () => import('../i18n/de'),
@@ -187,7 +188,7 @@ export function SettingsProvider({ children }) {
     setSettings(next)
     try {
       const token = localStorage.getItem('token')
-      const headers = { 'Content-Type': 'application/json' }
+      const headers = { 'Content-Type': 'application/json', ...CSRF_HEADERS }
       if (token && multiUser) headers.Authorization = `Bearer ${token}`
 
       const resp = await fetch('/api/settings/', {

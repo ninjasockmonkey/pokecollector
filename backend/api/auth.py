@@ -1,17 +1,29 @@
 import logging
 import os
+import threading
+import time
+from collections import deque
+from typing import Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError
+from jwt import InvalidTokenError as JWTError
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import get_db, get_setting, save_setting
 from models import User
-from services.auth import create_access_token, decode_token, hash_password, verify_password
+from services.auth import (
+    PasswordPolicyError,
+    burn_password_check,
+    create_access_token,
+    decode_token,
+    hash_password,
+    validate_new_password,
+    verify_password,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -25,10 +37,13 @@ class TokenResponse(BaseModel):
     user: dict
 
 
+UserRole = Literal["admin", "trainer"]
+
+
 class CreateUserRequest(BaseModel):
     username: str
     password: str
-    role: str = "trainer"
+    role: UserRole = "trainer"
     avatar_id: int | None = None
     must_change_password: bool = False
 
@@ -36,7 +51,7 @@ class CreateUserRequest(BaseModel):
 class UpdateUserRequest(BaseModel):
     username: str | None = None
     password: str | None = None
-    role: str | None = None
+    role: UserRole | None = None
     is_active: bool | None = None
     avatar_id: int | None = None
 
@@ -48,6 +63,87 @@ class ChangePasswordRequest(BaseModel):
 
 class ForceChangePasswordRequest(BaseModel):
     new_password: str
+
+
+def require_valid_password(password: str | None) -> str:
+    try:
+        return validate_new_password(password)
+    except PasswordPolicyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+def issue_access_token(user: User) -> str:
+    return create_access_token({
+        "sub": str(user.id),
+        "role": user.role,
+        "tv": int(user.token_version or 0),
+    })
+
+
+def revoke_sessions(user: User) -> None:
+    """Invalidate every access token issued to this user so far."""
+    user.token_version = int(user.token_version or 0) + 1
+
+
+# Repeated failures against one account are throttled regardless of client IP,
+# so rotating addresses (or sharing one behind a proxy) cannot be used to
+# brute-force a single password. In-process, like the per-IP limiter.
+LOGIN_FAILURES_PER_ACCOUNT = 10
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+_login_failures: dict[str, deque] = {}
+_login_failures_lock = threading.Lock()
+
+
+def _account_key(username: str | None) -> str:
+    return (username or "").strip().casefold()
+
+
+def _recent_failures(key: str, now: float) -> deque:
+    failures = _login_failures.setdefault(key, deque())
+    while failures and now - failures[0] > LOGIN_FAILURE_WINDOW_SECONDS:
+        failures.popleft()
+    return failures
+
+
+def _account_locked(username: str) -> bool:
+    now = time.monotonic()
+    with _login_failures_lock:
+        return len(_recent_failures(_account_key(username), now)) >= LOGIN_FAILURES_PER_ACCOUNT
+
+
+def _record_login_failure(username: str) -> None:
+    now = time.monotonic()
+    with _login_failures_lock:
+        _recent_failures(_account_key(username), now).append(now)
+        if len(_login_failures) > 10_000:
+            for stale in [k for k, v in _login_failures.items() if not v or now - v[-1] > LOGIN_FAILURE_WINDOW_SECONDS]:
+                _login_failures.pop(stale, None)
+
+
+def _clear_login_failures(username: str) -> None:
+    with _login_failures_lock:
+        _login_failures.pop(_account_key(username), None)
+
+
+# While a password change is pending, only what the forced-change screen needs
+# is served: the account itself, the password endpoints, and reading settings
+# (language/theme for the screen).
+_PENDING_PASSWORD_CHANGE_ALLOWED = {
+    ("GET", "/api/auth/me"),
+    ("GET", "/api/auth/mode"),
+    ("PUT", "/api/auth/me/force-password"),
+    ("PUT", "/api/auth/me/password"),
+    ("GET", "/api/settings/"),
+    ("GET", "/api/settings/exchange-rate"),
+}
+
+
+def _enforce_password_change(user: User, request: Request | None) -> None:
+    if request is None or not user.must_change_password:
+        return
+    if (request.method, request.url.path) in _PENDING_PASSWORD_CHANGE_ALLOWED:
+        return
+    raise HTTPException(status_code=403, detail="Password change required")
 
 
 def validate_avatar_id(avatar_id: int | None):
@@ -123,7 +219,11 @@ def multi_user_enabled(db: Session) -> bool:
     return str(multi).lower() == "true"
 
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+def get_current_user(
+    request: Request = None,
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> User:
     if not token:
         if not multi_user_enabled(db):
             admin = db.query(User).filter(User.role == "admin", User.is_active == True).first()
@@ -140,6 +240,10 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     user = db.query(User).filter(User.id == int(user_id), User.is_active == True).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    # Tokens issued before token versioning carry no "tv" claim and count as 0.
+    if int(payload.get("tv", 0)) != int(user.token_version or 0):
+        raise HTTPException(status_code=401, detail="Session expired")
+    _enforce_password_change(user, request)
     return user
 
 
@@ -154,15 +258,27 @@ def get_optional_user(token: str = Depends(oauth2_scheme), db: Session = Depends
             return None
     except JWTError:
         return None
-    return db.query(User).filter(User.id == int(user_id), User.is_active == True).first()
+    user = db.query(User).filter(User.id == int(user_id), User.is_active == True).first()
+    if user is None or int(payload.get("tv", 0)) != int(user.token_version or 0):
+        return None
+    return user
 
 
 @router.post("/login", response_model=TokenResponse)
 def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    if _account_locked(form_data.username):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts for this account. Try again later.",
+        )
     user = db.query(User).filter(User.username == form_data.username, User.is_active == True).first()
+    if not user:
+        burn_password_check(form_data.password)
     if not user or not verify_password(form_data.password, user.hashed_password):
+        _record_login_failure(form_data.username)
         raise HTTPException(status_code=401, detail="Incorrect username or password")
-    token = create_access_token({"sub": str(user.id), "role": user.role})
+    _clear_login_failures(form_data.username)
+    token = issue_access_token(user)
     return TokenResponse(
         access_token=token,
         user={
@@ -236,6 +352,7 @@ def create_user(
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     validate_avatar_id(data.avatar_id)
+    require_valid_password(data.password)
     existing = db.query(User).filter(User.username == data.username).first()
     if existing:
         raise HTTPException(status_code=400, detail="Username already exists")
@@ -272,10 +389,15 @@ def update_user(
         _sync_public_handle_for_username(db, user, data.username)
         user.username = data.username
     if data.password is not None:
-        user.hashed_password = hash_password(data.password)
+        user.hashed_password = hash_password(require_valid_password(data.password))
+        revoke_sessions(user)
     if data.role is not None:
+        if data.role != user.role:
+            revoke_sessions(user)
         user.role = data.role
     if data.is_active is not None:
+        if not data.is_active and user.is_active:
+            revoke_sessions(user)
         user.is_active = data.is_active
     if field_was_set(data, "avatar_id"):
         user.avatar_id = data.avatar_id
@@ -398,10 +520,12 @@ def change_password(
 ):
     if not verify_password(data.current_password, current_user.hashed_password):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
-    current_user.hashed_password = hash_password(data.new_password)
+    current_user.hashed_password = hash_password(require_valid_password(data.new_password))
     current_user.must_change_password = False
+    revoke_sessions(current_user)
     db.commit()
-    return {"message": "Password changed"}
+    # Other sessions are signed out; hand this one a fresh token.
+    return {"message": "Password changed", "access_token": issue_access_token(current_user)}
 
 
 @router.put("/me/force-password")
@@ -412,10 +536,11 @@ def force_change_password(
 ):
     if not current_user.must_change_password:
         raise HTTPException(status_code=400, detail="Password change is not required")
-    current_user.hashed_password = hash_password(data.new_password)
+    current_user.hashed_password = hash_password(require_valid_password(data.new_password))
     current_user.must_change_password = False
+    revoke_sessions(current_user)
     db.commit()
-    return {"message": "Password changed"}
+    return {"message": "Password changed", "access_token": issue_access_token(current_user)}
 
 
 @router.put("/me/avatar")
