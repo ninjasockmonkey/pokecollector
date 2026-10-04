@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import hmac
 import os
 import tempfile
 import unittest
@@ -5,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 try:
-    from jose import JWTError, jwt
+    import jwt
+    from jwt import InvalidTokenError as JWTError
 
     from services.auth import resolve_jwt_secret
 
@@ -37,7 +41,13 @@ class JwtSecretResolutionTests(unittest.TestCase):
     def test_token_forged_with_empty_key_is_rejected(self):
         with patch.dict(os.environ, self._env(JWT_SECRET_KEY=""), clear=False):
             secret = resolve_jwt_secret()
-        forged = jwt.encode({"sub": "1", "role": "admin"}, "", algorithm="HS256")
+        # PyJWT refuses to sign with an empty key, so build the forgery by hand.
+        def b64(data: bytes) -> bytes:
+            return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+        signing_input = b64(b'{"alg":"HS256","typ":"JWT"}') + b"." + b64(b'{"sub":"1","role":"admin"}')
+        signature = b64(hmac.new(b"", signing_input, hashlib.sha256).digest())
+        forged = (signing_input + b"." + signature).decode()
         with self.assertRaises(JWTError):
             jwt.decode(forged, secret, algorithms=["HS256"])
 
